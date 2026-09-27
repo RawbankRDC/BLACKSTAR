@@ -3571,26 +3571,38 @@ function accountIsAfterReset(userData){
 
 async function rejectOldAccount(firebaseUser, messageElement){
     if(!firebaseUser) return true;
+
     try{
         const snap = await getDoc(doc(db, "users", firebaseUser.uid));
-        if(!snap.exists()){
+
+        // Aucun profil Firestore = compte ancien/incomplet : accès refusé.
+        if(!snap.exists() || !accountIsAfterReset(snap.data())){
+            await signOut(auth);
+            currentUserCache = null;
+            localStorage.removeItem("serviceRDC_currentUser");
+
             if(messageElement){
                 messageElement.className = "message error";
-                messageElement.textContent = "Votre profil n'est pas encore disponible. Veuillez contacter l'administration.";
+                messageElement.textContent =
+                    "Numéro de téléphone ou mot de passe incorrect.";
             }
-            await signOut(auth).catch(()=>{});
             return true;
         }
-        return false;
     }catch(error){
-        console.error("Vérification du profil Firebase :", error);
+        console.error("Vérification de la remise à zéro du compte :", error);
+        await signOut(auth).catch(()=>{});
+        currentUserCache = null;
+        localStorage.removeItem("serviceRDC_currentUser");
+
         if(messageElement){
             messageElement.className = "message error";
-            messageElement.textContent = "Impossible de vérifier votre compte. Vérifiez votre connexion puis réessayez.";
+            messageElement.textContent =
+                "Impossible de vérifier votre compte. Veuillez créer un nouveau compte ou réessayer.";
         }
-        await signOut(auth).catch(()=>{});
         return true;
     }
+
+    return false;
 }
 
 // Sécurité anti-écran blanc : une erreur JavaScript inattendue affiche un message clair.
@@ -3948,22 +3960,34 @@ document.getElementById("registerForm").addEventListener("submit", async functio
     const firebaseEmail = firebaseEmailForPhone(phone);
 
     try{
-        // Vérifier le parrain AVANT de créer le compte Firebase.
-        let referredBy = null;
-        if(referralInput){
-            const sponsorQuery = query(collection(db, "users"), where("refCode", "==", referralInput));
-            const sponsorSnap = await getDocs(sponsorQuery);
-            if(sponsorSnap.empty){
-                message.className = "message error";
-                message.textContent = "Code de parrainage introuvable.";
-                return;
-            }
-            referredBy = sponsorSnap.docs[0].id;
-        }
-
         const credential = await createUserWithEmailAndPassword(auth, firebaseEmail, password);
         const firebaseUser = credential.user;
         const refCode = "SR" + firebaseUser.uid.substring(0, 8).toUpperCase();
+
+        // Recherche du parrain à partir de son code avant d'enregistrer le nouveau compte.
+        let referredBy = null;
+        if(referralInput){
+            try{
+                const sponsorQuery = query(collection(db, "users"), where("refCode", "==", referralInput));
+                const sponsorSnap = await getDocs(sponsorQuery);
+                if(!sponsorSnap.empty && sponsorSnap.docs[0].id !== firebaseUser.uid){
+                    referredBy = sponsorSnap.docs[0].id;
+                }else{
+                    await deleteUser(firebaseUser);
+                    registrationInProgress = false;
+                    message.className = "message error";
+                    message.textContent = "Code de parrainage introuvable.";
+                    return;
+                }
+            }catch(refError){
+                console.error("Erreur de vérification du parrain :", refError);
+                await deleteUser(firebaseUser).catch(()=>{});
+                registrationInProgress = false;
+                message.className = "message error";
+                message.textContent = "Impossible de vérifier le code de parrain. Réessayez.";
+                return;
+            }
+        }
 
         let level2By = null;
         let level3By = null;
@@ -4802,13 +4826,13 @@ function calculateWithdrawalPreview(){
     `;
 }
 
-async function submitWithdrawal(event){
+function submitWithdrawal(event){
     event.preventDefault();
     const form = event.currentTarget || document.getElementById("withdrawForm");
     const submitButton = form?.querySelector('button[type="submit"]');
     if(!lockButton(submitButton, "withdraw-submit", "Envoi du retrait...")) return;
     const user = getCurrentUser();
-    if(!user || !auth.currentUser){ unlockButton(submitButton, "withdraw-submit"); return; }
+    if(!user){ unlockButton(submitButton, "withdraw-submit"); return; }
 
     const currency = "FC";
     const amount = Number(document.getElementById("withdrawAmountInput").value);
@@ -4816,52 +4840,53 @@ async function submitWithdrawal(event){
 
     if(isNaN(amount) || amount <= 0 || !phone){
         alert("Veuillez remplir correctement tous les champs.");
-        unlockButton(submitButton, "withdraw-submit"); return;
+        unlockButton(submitButton, "withdraw-submit");
+        return;
     }
+
     if(currency === "FC" && amount < MIN_WITHDRAW_FC){
         alert(`Le minimum de retrait est de ${MIN_WITHDRAW_FC.toLocaleString()} FC.`);
-        unlockButton(submitButton, "withdraw-submit"); return;
+        unlockButton(submitButton, "withdraw-submit");
+        return;
+    }
+
+    if((user.balanceFC || 0) < amount){
+        alert("Solde FC insuffisant.");
+        unlockButton(submitButton, "withdraw-submit");
+        return;
     }
 
     const fee = amount * WITHDRAW_FEE_PERCENT;
     const netReceive = amount - fee;
-    const userRef = doc(db, "users", auth.currentUser.uid);
-    const requestId = "wd_" + Date.now() + "_" + Math.random().toString(36).slice(2,8);
 
-    try{
-        await runTransaction(db, async transaction => {
-            const snap = await transaction.get(userRef);
-            if(!snap.exists()) throw new Error("ACCOUNT_NOT_FOUND");
-            const data = snap.data();
-            const balance = Number(data.balanceFC || 0);
-            if(balance < amount) throw new Error("INSUFFICIENT_BALANCE");
-            const withdrawals = Array.isArray(data.withdrawals) ? data.withdrawals.map(w=>({...w})) : [];
-            if(withdrawals.some(w=>w.id===requestId)) throw new Error("DUPLICATE_WITHDRAWAL");
-            withdrawals.push({
-                id:requestId, amount:netReceive, requested:amount, fee, currency, phone,
-                status:"en_cours", requestedAt:new Date().toISOString(),
-                date:new Date().toLocaleString(), approvedAt:null, rejectedAt:null
-            });
-            const notifications=Array.isArray(data.notifications)?[...data.notifications]:[];
-            notifications.unshift({
-                title:"⏳ Retrait en cours",
-                text:`Votre demande de retrait de ${amount.toLocaleString()} FC est en cours de traitement.`,
-                date:new Date().toLocaleString(), read:false
-            });
-            transaction.update(userRef,{balanceFC:balance-amount,withdrawals,notifications,updatedAt:serverTimestamp()});
-        });
-        await loadCurrentUser(auth.currentUser);
-        updateProfile();
-        alert("Retrait envoyé avec succès. Statut : EN COURS. Il sera traité par l'administrateur.");
-        document.getElementById("withdrawForm").reset();
-        unlockButton(submitButton,"withdraw-submit",true);
-        showPage("home");
-    }catch(error){
-        console.error("Erreur retrait Firebase :",error);
-        alert(error?.message==="INSUFFICIENT_BALANCE"?"Solde FC insuffisant.":"Impossible d'enregistrer le retrait. Vérifiez votre connexion et réessayez.");
-        unlockButton(submitButton,"withdraw-submit");
-    }
+    const users = getUsers();
+    const index = users.findIndex(u => u.id === user.id);
+
+    users[index].balanceFC -= amount;
+
+    if(!users[index].withdrawals) users[index].withdrawals = [];
+    users[index].withdrawals.push({
+        id: "wd_" + Date.now() + "_" + Math.random().toString(36).slice(2,8),
+        amount: netReceive,
+        requested: amount,
+        fee: fee,
+        currency: "FC",
+        phone: phone,
+        status: "en_cours",
+        requestedAt: new Date().toISOString(),
+        date: new Date().toLocaleString(),
+        approvedAt: null,
+        rejectedAt: null
+    });
+
+    saveUsers(users);
+    updateProfile();
+    alert(`Retrait envoyé avec succès. Statut : EN COURS. Il sera traité par l'administrateur.`);
+    document.getElementById("withdrawForm").reset();
+    unlockButton(submitButton, "withdraw-submit", true);
+    showPage("home");
 }
+
 function markNotificationsAsRead(){
     const user = getCurrentUser();
     if(!user || !user.notifications) return;
