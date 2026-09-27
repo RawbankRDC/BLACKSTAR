@@ -3528,6 +3528,86 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
+/*
+ * REMISE À ZÉRO DES COMPTES
+ * Tous les comptes créés avant cette date sont considérés comme anciens
+ * et ne peuvent plus se connecter à cette version de la plateforme.
+ * Un nouveau compte doit être créé pour accéder à la plateforme.
+ */
+const ACCOUNT_RESET_AT = new Date("2026-09-27T10:14:00+02:00");
+
+/*
+ * NOUVELLE GÉNÉRATION DE COMPTES
+ * Les anciens comptes Firebase utilisent l'ancien identifiant "uXXXXXXXXX".
+ * Après la remise à zéro, les nouvelles inscriptions utilisent "v2_uXXXXXXXXX".
+ * Ainsi, un ancien numéro peut créer un nouveau compte.
+ * Une fois ce nouveau compte créé, une nouvelle inscription avec le même numéro
+ * déclenche normalement "Ce numéro de téléphone est déjà utilisé. Veuillez utiliser la connexion."
+ */
+const ACCOUNT_AUTH_NAMESPACE = "v2";
+
+function firebaseEmailForPhone(phone){
+    return `${ACCOUNT_AUTH_NAMESPACE}_u${phone}@auth.servicerdc.app`;
+}
+
+function accountIsAfterReset(userData){
+    if(!userData || !userData.createdAt) return false;
+
+    let createdAtDate = null;
+    try{
+        if(typeof userData.createdAt?.toDate === "function"){
+            createdAtDate = userData.createdAt.toDate();
+        }else if(userData.createdAt instanceof Date){
+            createdAtDate = userData.createdAt;
+        }else{
+            createdAtDate = new Date(userData.createdAt);
+        }
+    }catch(error){
+        console.error("Lecture de la date de création du compte :", error);
+        return false;
+    }
+
+    return createdAtDate instanceof Date &&
+           !Number.isNaN(createdAtDate.getTime()) &&
+           createdAtDate.getTime() >= ACCOUNT_RESET_AT.getTime();
+}
+
+async function rejectOldAccount(firebaseUser, messageElement){
+    if(!firebaseUser) return true;
+
+    try{
+        const snap = await getDoc(doc(db, "users", firebaseUser.uid));
+
+        // Aucun profil Firestore = compte ancien/incomplet : accès refusé.
+        if(!snap.exists() || !accountIsAfterReset(snap.data())){
+            await signOut(auth);
+            currentUserCache = null;
+            localStorage.removeItem("serviceRDC_currentUser");
+
+            if(messageElement){
+                messageElement.className = "message error";
+                messageElement.textContent =
+                    "Votre ancien compte a été réinitialisé. Veuillez créer un nouveau compte pour accéder à la plateforme.";
+            }
+            return true;
+        }
+    }catch(error){
+        console.error("Vérification de la remise à zéro du compte :", error);
+        await signOut(auth).catch(()=>{});
+        currentUserCache = null;
+        localStorage.removeItem("serviceRDC_currentUser");
+
+        if(messageElement){
+            messageElement.className = "message error";
+            messageElement.textContent =
+                "Impossible de vérifier votre compte. Veuillez créer un nouveau compte ou réessayer.";
+        }
+        return true;
+    }
+
+    return false;
+}
+
 // Sécurité anti-écran blanc : une erreur JavaScript inattendue affiche un message clair.
 window.addEventListener("error", (event) => {
     console.error("Erreur JavaScript BLACKSTAR :", event.error || event.message);
@@ -3883,7 +3963,7 @@ document.getElementById("registerForm").addEventListener("submit", async functio
     }
 
     registrationInProgress = true;
-    const firebaseEmail = `u${phone}@auth.servicerdc.app`;
+    const firebaseEmail = firebaseEmailForPhone(phone);
 
     try{
         const credential = await createUserWithEmailAndPassword(auth, firebaseEmail, password);
@@ -4011,19 +4091,28 @@ document.getElementById("loginForm").addEventListener("submit", async function(e
         return;
     }
 
-    const firebaseEmail = `u${phone}@auth.servicerdc.app`;
+    const firebaseEmail = firebaseEmailForPhone(phone);
 
     try{
-        await signInWithEmailAndPassword(auth, firebaseEmail, password);
+        const credential = await signInWithEmailAndPassword(auth, firebaseEmail, password);
+
+        const rejected = await rejectOldAccount(credential.user, message);
+        if(rejected){
+            unlockButton(submitButton, "login");
+            return;
+        }
+
         message.className = "message success";
         message.textContent = "Connexion réussie...";
         unlockButton(submitButton, "login", true);
     }catch(error){
         console.error("Erreur connexion Firebase :", error);
         message.className = "message error";
-        message.textContent = (error?.code === "auth/invalid-credential" || error?.code === "auth/user-not-found")
-            ? "Numéro de téléphone ou mot de passe incorrect."
-            : firebaseAuthError(error);
+        message.textContent = error?.code === "auth/user-not-found"
+            ? "Aucun compte actif avec ce numéro. Veuillez créer un nouveau compte."
+            : error?.code === "auth/invalid-credential"
+                ? "Numéro de téléphone ou mot de passe incorrect."
+                : firebaseAuthError(error);
     }finally{
         unlockButton(submitButton, "login");
     }
@@ -5663,6 +5752,17 @@ onAuthStateChanged(auth, async (firebaseUser) => {
 
     if(firebaseUser){
         try{
+            const rejected = await rejectOldAccount(
+                firebaseUser,
+                document.getElementById("loginMessage")
+            );
+            if(rejected){
+                document.getElementById("app").classList.add("hidden");
+                document.getElementById("authPage").classList.remove("hidden");
+                showLogin();
+                return;
+            }
+
             await loadCurrentUser(firebaseUser);
             subscribeToUserRealtime(firebaseUser);
             openApp();
